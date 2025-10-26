@@ -88,6 +88,106 @@ ConnectionStrategy Config::getConnectionStrategy() {
 
     return connectionStrategy.value();
 }
+
+bool Config::isValidIPAddress(const std::string& ip) {
+    int a, b, c, d;
+    if (sscanf(ip.c_str(), "%d.%d.%d.%d", &a, &b, &c, &d) != 4) {
+        return false;
+    }
+
+    if (a < 0 || a > 255 || b < 0 || b > 255 || c < 0 || c > 255 || d < 0 || d > 255) {
+        return false;
+    }
+
+    return true;
+}
+
+bool Config::isValidSSID(const std::string& ssid) {
+    if (ssid.empty()) {
+        return false;
+    }
+
+    if (ssid.length() > 32) {
+        return false;
+    }
+
+    return true;
+}
+
+bool Config::isValidPassword(const std::string& password, SecurityMode mode) {
+    if (mode == SecurityMode::OPEN) {
+        return password.empty();
+    }
+
+    if (mode == SecurityMode::WPA2_PERSONAL || mode == SecurityMode::WPA_PERSONAL) {
+        if (password.length() < 8 || password.length() > 63) {
+            return false;
+        }
+    }
+
+    if (mode == SecurityMode::WEP_64) {
+        if (password.length() != 5 && password.length() != 10) {
+            return false;
+        }
+    }
+
+    if (mode == SecurityMode::WEP_128) {
+        if (password.length() != 13 && password.length() != 26) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool Config::validateConfig() {
+    WifiInfo wifi = getWifiInfo();
+    bool valid = true;
+
+    // Validate SSID
+    if (!isValidSSID(wifi.ssid)) {
+        Logger::instance()->error("Invalid SSID: '%s' (must be 1-32 characters)\n", wifi.ssid.c_str());
+        valid = false;
+    }
+
+    // Validate password for security mode
+    if (!isValidPassword(wifi.key, wifi.securityMode)) {
+        Logger::instance()->error("Invalid password for security mode %d\n", static_cast<int>(wifi.securityMode));
+        if (wifi.securityMode == SecurityMode::WPA2_PERSONAL || wifi.securityMode == SecurityMode::WPA_PERSONAL) {
+            Logger::instance()->error("WPA/WPA2 password must be 8-63 characters\n");
+        }
+        valid = false;
+    }
+
+    // Validate IP address
+    if (!isValidIPAddress(wifi.ipAddress)) {
+        Logger::instance()->error("Invalid IP address: '%s'\n", wifi.ipAddress.c_str());
+        valid = false;
+    }
+
+    // Validate port
+    if (wifi.port < 1 || wifi.port > 65535) {
+        Logger::instance()->error("Invalid port: %d (must be 1-65535)\n", wifi.port);
+        valid = false;
+    }
+
+    // Validate BSSID format (if not empty)
+    if (!wifi.bssid.empty()) {
+        int mac[6];
+        if (sscanf(wifi.bssid.c_str(), "%x:%x:%x:%x:%x:%x", &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]) != 6) {
+            Logger::instance()->error("Invalid BSSID format: '%s' (expected XX:XX:XX:XX:XX:XX)\n", wifi.bssid.c_str());
+            valid = false;
+        }
+    }
+
+    if (valid) {
+        Logger::instance()->info("Configuration validation passed\n");
+    } else {
+        Logger::instance()->error("Configuration validation failed\n");
+    }
+
+    return valid;
+}
 #pragma endregion Config
 
 #pragma region Logger
@@ -96,18 +196,65 @@ ConnectionStrategy Config::getConnectionStrategy() {
     return &s_instance;
 }
 
-Logger::Logger() {
-    openlog(nullptr, LOG_PERROR | LOG_PID, LOG_USER);
+Logger::Logger() : m_logLevel(LogLevel::INFO) {
+    openlog("aawgd", LOG_PERROR | LOG_PID | LOG_CONS, LOG_DAEMON);
+
+    // Set log level from environment variable
+    const char* logLevelEnv = std::getenv("AAWG_LOG_LEVEL");
+    if (logLevelEnv != nullptr) {
+        std::string level(logLevelEnv);
+        if (level == "DEBUG") m_logLevel = LogLevel::DEBUG;
+        else if (level == "INFO") m_logLevel = LogLevel::INFO;
+        else if (level == "WARN") m_logLevel = LogLevel::WARN;
+        else if (level == "ERROR") m_logLevel = LogLevel::ERROR;
+    }
 }
 
 Logger::~Logger() {
     closelog();
 }
 
-void Logger::info(const char *format, ...) {
+void Logger::log(int priority, const char *format, va_list args) {
+    vsyslog(priority, format, args);
+}
+
+void Logger::debug(const char *format, ...) {
+    if (m_logLevel > LogLevel::DEBUG) return;
     va_list args;
     va_start(args, format);
-    vsyslog(LOG_INFO, format, args);
+    log(LOG_DEBUG, format, args);
     va_end(args);
+}
+
+void Logger::info(const char *format, ...) {
+    if (m_logLevel > LogLevel::INFO) return;
+    va_list args;
+    va_start(args, format);
+    log(LOG_INFO, format, args);
+    va_end(args);
+}
+
+void Logger::warn(const char *format, ...) {
+    if (m_logLevel > LogLevel::WARN) return;
+    va_list args;
+    va_start(args, format);
+    log(LOG_WARNING, format, args);
+    va_end(args);
+}
+
+void Logger::error(const char *format, ...) {
+    if (m_logLevel > LogLevel::ERROR) return;
+    va_list args;
+    va_start(args, format);
+    log(LOG_ERR, format, args);
+    va_end(args);
+}
+
+void Logger::setLogLevel(LogLevel level) {
+    m_logLevel = level;
+}
+
+LogLevel Logger::getLogLevel() const {
+    return m_logLevel;
 }
 #pragma endregion Logger

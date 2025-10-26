@@ -1,0 +1,8 @@
+syntax = "proto2";
+option optimize_for = LITE_RUNTIME;
+
+message WifiVersionResponse {
+    required int32 version_major = 1;
+    required int32 version_minor = 2;
+    optional int32 version_patch = 3;
+}

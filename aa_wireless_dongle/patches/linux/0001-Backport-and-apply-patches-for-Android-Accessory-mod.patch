@@ -483,7 +483,7 @@ index 000000000000..ce7814c22057
 +#include <linux/usb/composite.h>
 +
 +#define MAX_INST_NAME_LEN        40
-+#define BULK_BUFFER_SIZE    16384
++#define BULK_BUFFER_SIZE    131072
 +#define ACC_STRING_SIZE     256
 +
 +#define PROTOCOL_VERSION    2

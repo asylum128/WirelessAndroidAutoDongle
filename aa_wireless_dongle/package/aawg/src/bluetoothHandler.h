@@ -33,6 +33,7 @@ private:
     void setPairable(bool pairable);
     void exportProfiles();
     void connectDevice();
+    bool tryConnectToDevice(const std::string& device_path, bool isDongleMode);
 
     void startAdvertising();
     void stopAdvertising();
