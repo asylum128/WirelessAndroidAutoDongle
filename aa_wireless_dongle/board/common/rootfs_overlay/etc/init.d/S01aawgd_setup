@@ -1,0 +1,30 @@
+#!/bin/sh
+#
+# Setup directories for aawgd
+#
+
+case "$1" in
+	start)
+		# Create directories for persistent data
+		mkdir -p /var/lib/aawgd
+		mkdir -p /var/log
+
+		# Ensure proper permissions
+		chmod 755 /var/lib/aawgd
+		chmod 755 /var/log
+
+		# Make health check script executable
+		chmod +x /usr/bin/aawgd-health 2>/dev/null
+
+		echo "aawgd directories initialized"
+		;;
+	stop)
+		# Nothing to do on stop
+		;;
+	*)
+		echo "Usage: $0 {start|stop}"
+		exit 1
+		;;
+esac
+
+exit 0

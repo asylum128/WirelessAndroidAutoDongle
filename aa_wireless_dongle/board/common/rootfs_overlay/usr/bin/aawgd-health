@@ -1,0 +1,70 @@
+#!/bin/sh
+#
+# Health check script for AA Wireless Dongle
+#
+
+PIDFILE="/var/run/aawgd.pid"
+WATCHDOG_PIDFILE="/var/run/aawgd_watchdog.pid"
+CRASH_COUNT_FILE="/var/run/aawgd_crash_count"
+
+# Exit codes
+EXIT_OK=0
+EXIT_WARNING=1
+EXIT_CRITICAL=2
+EXIT_UNKNOWN=3
+
+# Check if daemon is running
+if [ ! -f "$PIDFILE" ]; then
+    echo "CRITICAL: aawgd is not running (no PID file)"
+    exit $EXIT_CRITICAL
+fi
+
+pid=$(cat "$PIDFILE")
+if ! kill -0 "$pid" 2>/dev/null; then
+    echo "CRITICAL: aawgd is not running (stale PID file)"
+    exit $EXIT_CRITICAL
+fi
+
+# Check if watchdog is running
+if [ ! -f "$WATCHDOG_PIDFILE" ]; then
+    echo "WARNING: watchdog is not running"
+    exit $EXIT_WARNING
+fi
+
+watchdog_pid=$(cat "$WATCHDOG_PIDFILE")
+if ! kill -0 "$watchdog_pid" 2>/dev/null; then
+    echo "WARNING: watchdog is not running (stale PID file)"
+    exit $EXIT_WARNING
+fi
+
+# Check crash count
+crash_count=0
+if [ -f "$CRASH_COUNT_FILE" ]; then
+    crash_count=$(cat "$CRASH_COUNT_FILE")
+    if [ "$crash_count" -ge 3 ]; then
+        echo "WARNING: High crash count ($crash_count)"
+        exit $EXIT_WARNING
+    fi
+fi
+
+# Check system resources
+mem_available=$(free | grep Mem | awk '{print $7}')
+mem_total=$(free | grep Mem | awk '{print $2}')
+
+if [ -n "$mem_available" ] && [ -n "$mem_total" ]; then
+    mem_percent=$((100 * mem_available / mem_total))
+    if [ "$mem_percent" -lt 10 ]; then
+        echo "WARNING: Low memory (${mem_percent}% available)"
+        exit $EXIT_WARNING
+    fi
+fi
+
+# Check USB connection
+if [ ! -e "/dev/usb_accessory" ]; then
+    echo "WARNING: USB accessory device not present"
+    # This might be OK if no connection active
+fi
+
+# All checks passed
+echo "OK: aawgd is healthy (PID: $pid, Watchdog: $watchdog_pid)"
+exit $EXIT_OK

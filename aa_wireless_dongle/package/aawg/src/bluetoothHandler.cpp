@@ -4,6 +4,7 @@
 #include "bluetoothHandler.h"
 #include "bluetoothProfiles.h"
 #include "bluetoothAdvertisement.h"
+#include "deviceManager.h"
 
 static constexpr const char* ADAPTER_ALIAS_PREFIX = "WirelessAADongle-";
 static constexpr const char* ADAPTER_ALIAS_DONGLE_PREFIX = "AndroidAuto-Dongle-";
@@ -175,47 +176,63 @@ void BluetoothHandler::stopAdvertising() {
 void BluetoothHandler::connectDevice() {
     DBus::ManagedObjects objects = getBluezObjects();
 
-    std::vector<std::string> device_paths;
+    // Build map of device paths to their properties
+    std::map<std::string, std::map<std::string, DBus::Properties>> device_map;
     for (auto const& [path, interfaces]: objects) {
         for (auto const& [interface, properties]: interfaces) {
             if (interface == INTERFACE_BLUEZ_DEVICE) {
-                device_paths.push_back(path);
+                device_map[path] = interfaces;
             }
         }
     }
 
-    if (!device_paths.size()) {
-        Logger::instance()->info("Did not find any connected bluetooth device\n");
+    if (device_map.empty()) {
+        Logger::instance()->info("Did not find any bluetooth devices\n");
         return;
     }
 
     const bool isDongleMode = (Config::instance()->getConnectionStrategy() == ConnectionStrategy::DONGLE_MODE);
 
-    Logger::instance()->info("Found %d bluetooth devices\n", device_paths.size());
+    Logger::instance()->info("Found %zu bluetooth devices\n", device_map.size());
 
-    for (const std::string &device_path: device_paths) {
-        Logger::instance()->info("Trying to connect bluetooth device at path: %s\n", device_path.c_str());
+    // Get prioritized list of known devices
+    std::vector<std::string> prioritized_macs = DeviceManager::instance()->getDevicesByPriority();
 
-        std::shared_ptr<DBus::ObjectProxy> bluezDevice = m_connection->create_object_proxy(BLUEZ_BUS_NAME, device_path);
-        DBus::MethodProxy connectProfile = *(bluezDevice->create_method<void(std::string)>(INTERFACE_BLUEZ_DEVICE, "ConnectProfile"));
-        DBus::MethodProxy disconnect = *(bluezDevice->create_method<void()>(INTERFACE_BLUEZ_DEVICE, "Disconnect"));
+    // Try known devices first, in priority order
+    for (const std::string& mac_address : prioritized_macs) {
+        Logger::instance()->info("Trying prioritized device: %s\n", mac_address.c_str());
 
-        std::shared_ptr<DBus::PropertyProxy<bool>> deviceConnected = bluezDevice->create_property<bool>(INTERFACE_BLUEZ_DEVICE, "Connected");
+        // Find matching device path
+        for (const auto& [path, interfaces] : device_map) {
+            std::shared_ptr<DBus::ObjectProxy> bluezDevice = m_connection->create_object_proxy(BLUEZ_BUS_NAME, path);
+            std::shared_ptr<DBus::PropertyProxy<std::string>> deviceAddress =
+                bluezDevice->create_property<std::string>(INTERFACE_BLUEZ_DEVICE, "Address");
 
-        try {
-            if (deviceConnected) {
-                Logger::instance()->info("Bluetooth device already connected, disconnecting\n");
-                disconnect();
+            if (deviceAddress && deviceAddress->get_value() == mac_address) {
+                if (tryConnectToDevice(path, isDongleMode)) {
+                    return;
+                }
             }
-            connectProfile(isDongleMode ? "" : HSP_AG_UUID);
-            Logger::instance()->info("Bluetooth connected to the device\n");
-            if (!isDongleMode) {
-                return;
-            }
-        } catch (DBus::Error& e) {
-            if (!isDongleMode) {
-                Logger::instance()->info("Failed to connect device at path: %s\n", device_path.c_str());
-            }
+        }
+    }
+
+    // Try remaining devices that aren't in our known list
+    for (const auto& [path, interfaces] : device_map) {
+        std::shared_ptr<DBus::ObjectProxy> bluezDevice = m_connection->create_object_proxy(BLUEZ_BUS_NAME, path);
+        std::shared_ptr<DBus::PropertyProxy<std::string>> deviceAddress =
+            bluezDevice->create_property<std::string>(INTERFACE_BLUEZ_DEVICE, "Address");
+
+        std::string mac_address = deviceAddress ? deviceAddress->get_value() : "";
+
+        // Skip if already tried
+        if (std::find(prioritized_macs.begin(), prioritized_macs.end(), mac_address) != prioritized_macs.end()) {
+            continue;
+        }
+
+        Logger::instance()->info("Trying new device at path: %s\n", path.c_str());
+
+        if (tryConnectToDevice(path, isDongleMode)) {
+            return;
         }
     }
 
@@ -224,17 +241,84 @@ void BluetoothHandler::connectDevice() {
     }
 }
 
+bool BluetoothHandler::tryConnectToDevice(const std::string& device_path, bool isDongleMode) {
+    try {
+        std::shared_ptr<DBus::ObjectProxy> bluezDevice = m_connection->create_object_proxy(BLUEZ_BUS_NAME, device_path);
+        DBus::MethodProxy connectProfile = *(bluezDevice->create_method<void(std::string)>(INTERFACE_BLUEZ_DEVICE, "ConnectProfile"));
+        DBus::MethodProxy disconnect = *(bluezDevice->create_method<void()>(INTERFACE_BLUEZ_DEVICE, "Disconnect"));
+
+        std::shared_ptr<DBus::PropertyProxy<bool>> deviceConnected = bluezDevice->create_property<bool>(INTERFACE_BLUEZ_DEVICE, "Connected");
+        std::shared_ptr<DBus::PropertyProxy<std::string>> deviceAddress = bluezDevice->create_property<std::string>(INTERFACE_BLUEZ_DEVICE, "Address");
+        std::shared_ptr<DBus::PropertyProxy<std::string>> deviceName = bluezDevice->create_property<std::string>(INTERFACE_BLUEZ_DEVICE, "Name");
+
+        std::string mac_address = deviceAddress ? deviceAddress->get_value() : "unknown";
+        std::string name = deviceName ? deviceName->get_value() : "Unknown Device";
+
+        if (deviceConnected && deviceConnected->get_value()) {
+            Logger::instance()->info("Device already connected, disconnecting first\n");
+            disconnect();
+        }
+
+        connectProfile(isDongleMode ? "" : HSP_AG_UUID);
+        Logger::instance()->info("Successfully connected to device: %s (%s)\n", name.c_str(), mac_address.c_str());
+
+        // Record successful connection
+        DeviceManager::instance()->recordConnection(mac_address, name);
+
+        return true;
+
+    } catch (DBus::Error& e) {
+        Logger::instance()->warn("Failed to connect to device at path: %s - %s\n", device_path.c_str(), e.what());
+
+        // Try to get MAC address for failure tracking
+        try {
+            std::shared_ptr<DBus::ObjectProxy> bluezDevice = m_connection->create_object_proxy(BLUEZ_BUS_NAME, device_path);
+            std::shared_ptr<DBus::PropertyProxy<std::string>> deviceAddress = bluezDevice->create_property<std::string>(INTERFACE_BLUEZ_DEVICE, "Address");
+            if (deviceAddress) {
+                DeviceManager::instance()->recordConnectionFailure(deviceAddress->get_value());
+            }
+        } catch (...) {
+            // Ignore errors getting MAC address
+        }
+
+        return false;
+    }
+}
+
 void BluetoothHandler::retryConnectLoop() {
     bool should_exit = false;
     std::future<void> connectWithRetryFuture = connectWithRetryPromise->get_future();
 
-    while (!should_exit) {
+    int retry_count = 0;
+    int retry_delay = 5; // Start with 5 seconds
+    const int max_delay = 60; // Cap at 60 seconds
+    const int max_retries = 20; // Give up after 20 attempts
+
+    while (!should_exit && retry_count < max_retries) {
+        Logger::instance()->info("Bluetooth connection attempt %d/%d\n", retry_count + 1, max_retries);
+
         connectDevice();
 
-        if (connectWithRetryFuture.wait_for(std::chrono::seconds(20)) == std::future_status::ready) {
+        retry_count++;
+
+        // Wait with exponential backoff
+        if (connectWithRetryFuture.wait_for(std::chrono::seconds(retry_delay)) == std::future_status::ready) {
             should_exit = true;
             connectWithRetryPromise = nullptr;
+            Logger::instance()->info("Bluetooth connection successful after %d attempts\n", retry_count);
+            retry_count = 0; // Reset for next connection cycle
+            retry_delay = 5;
+        } else {
+            // Connection not established, increase delay
+            if (retry_count > 1) {
+                retry_delay = std::min(retry_delay * 2, max_delay);
+                Logger::instance()->info("Connection failed, retrying in %d seconds\n", retry_delay);
+            }
         }
+    }
+
+    if (retry_count >= max_retries) {
+        Logger::instance()->error("Bluetooth connection failed after %d attempts, giving up\n", max_retries);
     }
 
     if (Config::instance()->getConnectionStrategy() != ConnectionStrategy::DONGLE_MODE) {

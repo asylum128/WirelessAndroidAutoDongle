@@ -1,0 +1,22 @@
+/var/log/aawgd.log {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    size 10M
+    postrotate
+        /usr/bin/killall -HUP syslogd
+    endscript
+}
+
+/var/log/messages {
+    weekly
+    rotate 4
+    compress
+    delaycompress
+    missingok
+    notifempty
+    size 50M
+}

@@ -1,13 +1,82 @@
 #!/bin/sh
 #
-# Start aawgd daemon
+# Start aawgd daemon with respawn capability
 #
 
 DAEMON="aawgd"
 PIDFILE="/var/run/$DAEMON.pid"
+WATCHDOG_PIDFILE="/var/run/${DAEMON}_watchdog.pid"
+CRASH_COUNT_FILE="/var/run/${DAEMON}_crash_count"
 
+# Maximum number of crashes within CRASH_WINDOW before giving up
+MAX_CRASHES=5
+CRASH_WINDOW=300  # 5 minutes
 
 RETVAL=0
+
+# Watchdog function to monitor and restart daemon
+watchdog() {
+	local crash_count=0
+	local window_start=$(date +%s)
+
+	while true; do
+		# Check if daemon is still running
+		if [ -f "$PIDFILE" ]; then
+			pid=$(cat "$PIDFILE")
+			if ! kill -0 "$pid" 2>/dev/null; then
+				# Process died, increment crash count
+				crash_count=$((crash_count + 1))
+				current_time=$(date +%s)
+				elapsed=$((current_time - window_start))
+
+				logger -t aawgd_watchdog "Daemon crashed (count: $crash_count)"
+
+				# Reset counter if outside window
+				if [ $elapsed -gt $CRASH_WINDOW ]; then
+					crash_count=1
+					window_start=$current_time
+					logger -t aawgd_watchdog "Crash window reset"
+				fi
+
+				# Check if we've exceeded max crashes
+				if [ $crash_count -ge $MAX_CRASHES ]; then
+					logger -t aawgd_watchdog "ERROR: Too many crashes ($crash_count in ${elapsed}s), giving up"
+					echo $crash_count > "$CRASH_COUNT_FILE"
+					rm -f "$WATCHDOG_PIDFILE"
+					exit 1
+				fi
+
+				# Restart daemon
+				logger -t aawgd_watchdog "Restarting daemon (attempt $crash_count/$MAX_CRASHES)"
+				rm -f "$PIDFILE"
+				start-stop-daemon -S -b -q -m -p "$PIDFILE" -x "/usr/bin/$DAEMON"
+
+				# Exponential backoff
+				sleep_time=$((2 ** (crash_count - 1)))
+				if [ $sleep_time -gt 60 ]; then
+					sleep_time=60
+				fi
+				logger -t aawgd_watchdog "Waiting ${sleep_time}s before next check"
+				sleep $sleep_time
+			else
+				# Daemon is healthy, reset crash count if we've been stable
+				current_time=$(date +%s)
+				elapsed=$((current_time - window_start))
+				if [ $elapsed -gt $CRASH_WINDOW ] && [ $crash_count -gt 0 ]; then
+					logger -t aawgd_watchdog "Daemon stable for ${CRASH_WINDOW}s, resetting crash counter"
+					crash_count=0
+					window_start=$current_time
+				fi
+				sleep 5
+			fi
+		else
+			# No PID file, daemon not running
+			logger -t aawgd_watchdog "No PID file found, exiting watchdog"
+			rm -f "$WATCHDOG_PIDFILE"
+			exit 0
+		fi
+	done
+}
 
 case "$1" in
 	start)
@@ -19,20 +88,64 @@ case "$1" in
 		printf "Starting $DAEMON: "
 		start-stop-daemon -S -b -q -m -p "$PIDFILE" -x "/usr/bin/$DAEMON"
 		RETVAL=$?
-		[ $RETVAL = 0 ] && echo "OK" || echo "FAIL"
+
+		if [ $RETVAL = 0 ]; then
+			echo "OK"
+			# Start watchdog in background
+			watchdog &
+			echo $! > "$WATCHDOG_PIDFILE"
+			logger -t aawgd "Started with watchdog (PID: $!)"
+		else
+			echo "FAIL"
+		fi
 		;;
 	stop)
 		printf "Stopping $DAEMON: "
+
+		# Stop watchdog first
+		if [ -f "$WATCHDOG_PIDFILE" ]; then
+			watchdog_pid=$(cat "$WATCHDOG_PIDFILE")
+			kill "$watchdog_pid" 2>/dev/null
+			rm -f "$WATCHDOG_PIDFILE"
+		fi
+
+		# Stop daemon
 		start-stop-daemon -K -q -p "$PIDFILE"
 		RETVAL=$?
+
+		# Clean up
+		rm -f "$PIDFILE"
+		rm -f "$CRASH_COUNT_FILE"
+
 		[ $RETVAL = 0 ] && echo "OK" || echo "FAIL"
 		;;
 	restart)
 		$0 stop
+		sleep 2
 		$0 start
 		;;
+	status)
+		if [ -f "$PIDFILE" ]; then
+			pid=$(cat "$PIDFILE")
+			if kill -0 "$pid" 2>/dev/null; then
+				echo "$DAEMON is running (PID: $pid)"
+				if [ -f "$WATCHDOG_PIDFILE" ]; then
+					watchdog_pid=$(cat "$WATCHDOG_PIDFILE")
+					echo "Watchdog is running (PID: $watchdog_pid)"
+				fi
+				if [ -f "$CRASH_COUNT_FILE" ]; then
+					crashes=$(cat "$CRASH_COUNT_FILE")
+					echo "Crash count: $crashes"
+				fi
+			else
+				echo "$DAEMON is not running (stale PID file)"
+			fi
+		else
+			echo "$DAEMON is not running"
+		fi
+		;;
 	*)
-		echo "Usage: $0 {start|stop}"
+		echo "Usage: $0 {start|stop|restart|status}"
 		;;
 esac
 

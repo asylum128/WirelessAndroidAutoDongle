@@ -1,0 +1,110 @@
+#!/bin/sh
+#
+# Diagnostic tool for AA Wireless Dongle
+# Analyzes logs and provides helpful troubleshooting information
+#
+
+LOG_FILE="/var/log/aawgd.log"
+MESSAGES_FILE="/var/log/messages"
+
+echo "=========================================="
+echo "  AA Wireless Dongle Diagnostics"
+echo "=========================================="
+echo ""
+
+# Check if daemon is running
+if [ -f "/var/run/aawgd.pid" ]; then
+    pid=$(cat /var/run/aawgd.pid)
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "[OK] Daemon is running (PID: $pid)"
+    else
+        echo "[ERROR] Daemon is not running (stale PID file)"
+    fi
+else
+    echo "[ERROR] Daemon is not running"
+fi
+echo ""
+
+# Check configuration
+echo "Configuration Check:"
+if [ -f "/etc/aawgd.conf" ]; then
+    source /etc/aawgd.conf 2>/dev/null
+    echo "  Country Code: ${AAWG_COUNTRY_CODE:-Not set}"
+    echo "  Connection Strategy: ${AAWG_CONNECTION_STRATEGY:-1 (Phone First)}"
+    echo "  SSH Enabled: ${AAWG_ENABLE_SSH:-No}"
+else
+    echo "  [ERROR] Configuration file not found"
+fi
+echo ""
+
+# Check recent errors
+echo "Recent Errors (last 10):"
+if [ -f "$LOG_FILE" ]; then
+    grep -i "error" "$LOG_FILE" | tail -10 | while read -r line; do
+        echo "  $line"
+    done
+
+    error_count=$(grep -c -i "error" "$LOG_FILE")
+    echo "  Total errors in log: $error_count"
+else
+    echo "  No log file found"
+fi
+echo ""
+
+# Common issues detection
+echo "Common Issues Detection:"
+
+# Check USB cable issue
+if grep -q "error opening /dev/usb_accessory" "$LOG_FILE" 2>/dev/null; then
+    echo "  [!] USB Connection Issue Detected"
+    echo "      - Ensure you're using the correct USB port (OTG port)"
+    echo "      - Verify cable is a data cable, not power-only"
+    echo "      - Check cable quality"
+fi
+
+# Check Bluetooth issues
+if grep -q "Did not find any bluetooth" "$LOG_FILE" 2>/dev/null; then
+    echo "  [!] Bluetooth Adapter Issue"
+    echo "      - Bluetooth adapter may not be working"
+    echo "      - Check if Bluetooth is enabled on phone"
+fi
+
+# Check WiFi issues
+if grep -q "Failed to start proxy server" "$LOG_FILE" 2>/dev/null; then
+    echo "  [!] Network Server Issue"
+    echo "      - Port may be in use"
+    echo "      - WiFi may not be configured correctly"
+fi
+
+# Check crash count
+if [ -f "/var/run/aawgd_crash_count" ]; then
+    crashes=$(cat /var/run/aawgd_crash_count)
+    echo "  [!] Crash Count: $crashes"
+    echo "      - Multiple crashes detected"
+    echo "      - Check system resources (memory, CPU)"
+fi
+
+# Check memory
+mem_info=$(free -m | grep Mem)
+mem_total=$(echo $mem_info | awk '{print $2}')
+mem_available=$(echo $mem_info | awk '{print $7}')
+if [ -n "$mem_available" ] && [ "$mem_available" -lt 50 ]; then
+    echo "  [!] Low Memory: ${mem_available}MB available"
+    echo "      - System may be running out of memory"
+fi
+
+echo ""
+echo "Recent Connection Activity (last 5):"
+if [ -f "$LOG_FILE" ]; then
+    grep "Connection cycle\|connected\|disconnected" "$LOG_FILE" | tail -5 | while read -r line; do
+        echo "  $line"
+    done
+fi
+
+echo ""
+echo "Suggestions:"
+echo "  - View full logs: cat $LOG_FILE"
+echo "  - Check daemon status: /etc/init.d/S93aawgd status"
+echo "  - Enable debug logging: Set AAWG_LOG_LEVEL=DEBUG in /etc/aawgd.conf"
+echo "  - Restart daemon: /etc/init.d/S93aawgd restart"
+echo ""

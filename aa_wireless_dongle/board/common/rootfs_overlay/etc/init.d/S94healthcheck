@@ -1,0 +1,45 @@
+#!/bin/sh
+#
+# Periodic health check for aawgd
+#
+
+DAEMON="aawgd-health"
+INTERVAL=300  # Check every 5 minutes
+
+PIDFILE="/var/run/healthcheck.pid"
+
+case "$1" in
+	start)
+		printf "Starting health monitoring: "
+		# Run health checks periodically in background
+		(
+			while true; do
+				sleep $INTERVAL
+				/usr/bin/aawgd-health >> /var/log/aawgd.log 2>&1
+			done
+		) &
+		echo $! > "$PIDFILE"
+		echo "OK"
+		;;
+	stop)
+		printf "Stopping health monitoring: "
+		if [ -f "$PIDFILE" ]; then
+			kill $(cat "$PIDFILE") 2>/dev/null
+			rm -f "$PIDFILE"
+			echo "OK"
+		else
+			echo "FAIL"
+		fi
+		;;
+	restart)
+		$0 stop
+		sleep 1
+		$0 start
+		;;
+	*)
+		echo "Usage: $0 {start|stop|restart}"
+		exit 1
+		;;
+esac
+
+exit 0
