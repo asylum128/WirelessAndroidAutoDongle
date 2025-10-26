@@ -119,6 +119,13 @@ public:
 
         if (!transitionTo(State::COMPLETED)) return false;
         Logger::instance()->info("Bluetooth handshake completed successfully\n");
+
+        // Wait for phone to sync time before main connection
+        // The async optimizations make connection so fast that time sync hasn't
+        // completed yet, causing "time mismatch" warnings in some head units
+        Logger::instance()->info("Waiting 3s for time synchronization...\n");
+        sleep(3);
+
         return true;
     }
 
