@@ -38,13 +38,6 @@ public:
         int fd_flags = fcntl(m_fd, F_GETFL);
         fcntl(m_fd, F_SETFL, fd_flags & ~O_NONBLOCK);
 
-        // Set read timeout
-        struct timeval tv = {.tv_sec = 10, .tv_usec = 0};
-        if (setsockopt(m_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
-            Logger::instance()->error("Failed to set socket timeout: %s\n", strerror(errno));
-            return false;
-        }
-
         WifiInfo wifiInfo = Config::instance()->getWifiInfo();
 
         // State 1: Send WifiStartRequest
@@ -95,37 +88,16 @@ public:
             return false;
         }
 
-        // State 4: Wait for optional responses
+        // State 4: Wait for completion messages (blocking, like main branch)
         if (!transitionTo(State::WAITING_FOR_COMPLETION)) return false;
 
-        // Phone may send WifiConnectStatus and/or WifiStartResponse
-        int max_additional_messages = 3;
-        for (int i = 0; i < max_additional_messages; i++) {
-            messageId = ReadMessage();
-
-            if (messageId == MessageId::Invalid) {
-                // Timeout or connection closed - this is okay
-                break;
-            }
-
-            if (messageId == MessageId::WifiConnectStatus) {
-                Logger::instance()->info("Received WifiConnectStatus\n");
-            } else if (messageId == MessageId::WifiStartResponse) {
-                Logger::instance()->info("Received WifiStartResponse\n");
-            } else {
-                Logger::instance()->warn("Unexpected message: %s\n", MessageName(messageId).c_str());
-            }
-        }
+        // Phone sends WifiConnectStatus and WifiStartResponse
+        // Block and wait for exactly 2 messages (like main branch did)
+        ReadMessage();
+        ReadMessage();
 
         if (!transitionTo(State::COMPLETED)) return false;
         Logger::instance()->info("Bluetooth handshake completed successfully\n");
-
-        // Wait for phone to sync time before main connection
-        // The async optimizations make connection so fast that time sync hasn't
-        // completed yet, causing "time mismatch" warnings in some head units
-        Logger::instance()->info("Waiting 3s for time synchronization...\n");
-        sleep(3);
-
         return true;
     }
 
