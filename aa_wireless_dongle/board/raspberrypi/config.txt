@@ -15,10 +15,10 @@ hdmi_blanking=1
 
 # How much memory in MB to assign to the GPU on Pi models having
 # 256, 512 or 1024 MB total memory
-# Reduced GPU memory to allocate more to CPU for better USB/network performance
-gpu_mem_256=16
-gpu_mem_512=16
-gpu_mem_1024=16
+# Minimal GPU memory for headless operation (64MB minimum for stable boot)
+gpu_mem_256=64
+gpu_mem_512=64
+gpu_mem_1024=64
 
 # Enable autoprobing of Bluetooth driver without need of hciattach/btattach
 dtparam=krnbt=on
