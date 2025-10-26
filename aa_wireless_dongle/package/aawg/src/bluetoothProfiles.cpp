@@ -31,51 +31,30 @@ BluezProfile::BluezProfile(DBus::Path path): DBus::Object(path) {
 #pragma region AAWirelessLauncher
 class AAWirelessLauncher {
 public:
-    AAWirelessLauncher(int fd): m_fd(fd), m_state(State::INITIAL) {};
+    AAWirelessLauncher(int fd): m_fd(fd) {};
 
-    bool launch() {
+    void launch() {
         // Make fd blocking
         int fd_flags = fcntl(m_fd, F_GETFL);
         fcntl(m_fd, F_SETFL, fd_flags & ~O_NONBLOCK);
 
         WifiInfo wifiInfo = Config::instance()->getWifiInfo();
 
-        // State 1: Send WifiStartRequest
-        if (!transitionTo(State::SENDING_START_REQUEST)) return false;
-
-        Logger::instance()->info("Sending WifiStartRequest (ip: %s, port: %d)\n",
-                                 wifiInfo.ipAddress.c_str(), wifiInfo.port);
+        Logger::instance()->info("Sending WifiStartRequest (ip: %s, port: %d)\n", wifiInfo.ipAddress.c_str(), wifiInfo.port);
         WifiStartRequest wifiStartRequest;
         wifiStartRequest.set_ip_address(wifiInfo.ipAddress);
         wifiStartRequest.set_port(wifiInfo.port);
 
-        if (!SendMessage(MessageId::WifiStartRequest, &wifiStartRequest)) {
-            Logger::instance()->error("Failed to send WifiStartRequest\n");
-            return false;
-        }
-
-        // State 2: Wait for WifiInfoRequest or WifiVersionRequest
-        if (!transitionTo(State::WAITING_FOR_REQUEST)) return false;
+        SendMessage(MessageId::WifiStartRequest, &wifiStartRequest);
 
         MessageId messageId = ReadMessage();
 
-        // Handle version request if phone sends it
-        if (messageId == MessageId::WifiVersionRequest) {
-            if (!handleVersionRequest()) return false;
-            messageId = ReadMessage(); // Read next message
-        }
-
         if (messageId != MessageId::WifiInfoRequest) {
-            Logger::instance()->error("Expected WifiInfoRequest, got %s (%d)\n",
-                                     MessageName(messageId).c_str(), messageId);
-            return false;
+            Logger::instance()->info("Expected WifiInfoRequest, got %s (%d). Abort.\n", MessageName(messageId), messageId);
+            return;
         }
 
-        // State 3: Send WifiInfoResponse
-        if (!transitionTo(State::SENDING_WIFI_INFO)) return false;
-
-        Logger::instance()->info("Sending WifiInfoResponse (ssid: %s, bssid: %s)\n",
-                                 wifiInfo.ssid.c_str(), wifiInfo.bssid.c_str());
+        Logger::instance()->info("Sending WifiInfoResponse (ssid: %s, bssid: %s)\n", wifiInfo.ssid.c_str(), wifiInfo.bssid.c_str());
         WifiInfoResponse wifiInfoResponse;
         wifiInfoResponse.set_ssid(wifiInfo.ssid);
         wifiInfoResponse.set_key(wifiInfo.key);
@@ -83,35 +62,13 @@ public:
         wifiInfoResponse.set_security_mode(wifiInfo.securityMode);
         wifiInfoResponse.set_access_point_type(wifiInfo.accessPointType);
 
-        if (!SendMessage(MessageId::WifiInfoResponse, &wifiInfoResponse)) {
-            Logger::instance()->error("Failed to send WifiInfoResponse\n");
-            return false;
-        }
+        SendMessage(MessageId::WifiInfoResponse, &wifiInfoResponse);
 
-        // State 4: Wait for completion messages (blocking, like main branch)
-        if (!transitionTo(State::WAITING_FOR_COMPLETION)) return false;
-
-        // Phone sends WifiConnectStatus and WifiStartResponse
-        // Block and wait for exactly 2 messages (like main branch did)
         ReadMessage();
         ReadMessage();
-
-        if (!transitionTo(State::COMPLETED)) return false;
-        Logger::instance()->info("Bluetooth handshake completed successfully\n");
-        return true;
     }
 
 private:
-    enum class State {
-        INITIAL,
-        SENDING_START_REQUEST,
-        WAITING_FOR_REQUEST,
-        SENDING_WIFI_INFO,
-        WAITING_FOR_COMPLETION,
-        COMPLETED,
-        ERROR
-    };
-
     enum class MessageId {
         Invalid = -1,
         WifiStartRequest = 1,
@@ -122,29 +79,6 @@ private:
         WifiConnectStatus = 6,
         WifiStartResponse = 7,
     };
-
-    bool transitionTo(State newState) {
-        Logger::instance()->debug("State transition: %d -> %d\n", static_cast<int>(m_state), static_cast<int>(newState));
-        m_state = newState;
-        return true;
-    }
-
-    bool handleVersionRequest() {
-        Logger::instance()->info("Handling WifiVersionRequest\n");
-
-        WifiVersionResponse versionResp;
-        versionResp.set_version_major(1);
-        versionResp.set_version_minor(0);
-        versionResp.set_version_patch(0);
-
-        if (!SendMessage(MessageId::WifiVersionResponse, &versionResp)) {
-            Logger::instance()->error("Failed to send WifiVersionResponse\n");
-            return false;
-        }
-
-        return true;
-    }
-
     std::string MessageName(MessageId messageId) {
         switch (messageId) {
             case MessageId::WifiStartRequest:
@@ -166,14 +100,9 @@ private:
         }
     }
 
-    bool SendMessage(MessageId messageId, google::protobuf::MessageLite* message) {
+    void SendMessage(MessageId messageId, google::protobuf::MessageLite* message) {
         uint16_t messageSize = (uint16_t)message->ByteSizeLong();
         uint16_t length = messageSize + 4;
-
-        if (length > 65535) {
-            Logger::instance()->error("Message too large: %d bytes\n", length);
-            return false;
-        }
 
         unsigned char* buffer = new unsigned char[length];
 
@@ -184,92 +113,50 @@ private:
         networkShort = htons(static_cast<uint16_t>(messageId));
         memcpy(buffer + 2, &networkShort, sizeof(networkShort));
 
-        if (!message->SerializeToArray(buffer + 4, messageSize)) {
-            Logger::instance()->error("Failed to serialize %s\n", MessageName(messageId).c_str());
-            delete[] buffer;
-            return false;
-        }
+        message->SerializeToArray(buffer + 4, messageSize);
 
         ssize_t wrote = write(m_fd, buffer, length);
-        delete[] buffer;
-
         if (wrote < 0) {
-            Logger::instance()->error("Error sending %s: %s\n", MessageName(messageId).c_str(), strerror(errno));
-            return false;
+            Logger::instance()->info("Error sending %s, messageId: %d\n", MessageName(messageId).c_str(), messageId);
         }
-        else if ((size_t)wrote != length) {
-            Logger::instance()->error("Partial write for %s: %zd/%d bytes\n", MessageName(messageId).c_str(), wrote, length);
-            return false;
+        else {
+            Logger::instance()->info("Sent %s, messageId: %d, wrote %d bytes\n", MessageName(messageId).c_str(), messageId, wrote);
         }
 
-        Logger::instance()->info("Sent %s (%d bytes)\n", MessageName(messageId).c_str(), wrote);
-        return true;
+        delete[] buffer;
     }
 
     MessageId ReadMessage() {
         uint16_t networkShort = 0;
         ssize_t readBytes;
 
-        // Read length
         readBytes = read(m_fd, &networkShort, 2);
-        if (readBytes == 0) {
-            Logger::instance()->info("Connection closed by peer\n");
-            return MessageId::Invalid;
-        }
         if (readBytes != 2) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                Logger::instance()->warn("Read timeout\n");
-            } else {
-                Logger::instance()->error("Error reading length: %s\n", strerror(errno));
-            }
+            // Could not read 2 bytes. Do something.
+            Logger::instance()->info("Error reading length, read bytes: %d, errno: %s\n", readBytes, strerror(errno));
             return MessageId::Invalid;
         }
         uint16_t length = ntohs(networkShort);
 
-        if (length > 32768) {  // Sanity check - messages shouldn't be > 32KB
-            Logger::instance()->error("Invalid message length: %d bytes\n", length);
-            return MessageId::Invalid;
-        }
-
-        // Read message ID
         readBytes = read(m_fd, &networkShort, 2);
         if (readBytes != 2) {
-            Logger::instance()->error("Error reading message ID: %s\n", strerror(errno));
+            // Could not read 2 bytes. Do something.
+            Logger::instance()->info("Error reading message id, read bytes: %d, errno: %s\n", readBytes, strerror(errno));
             return MessageId::Invalid;
         }
         MessageId messageId = static_cast<MessageId>(ntohs(networkShort));
 
-        // Validate message ID
-        if (messageId < MessageId::WifiStartRequest || messageId > MessageId::WifiStartResponse) {
-            Logger::instance()->error("Invalid message ID: %d\n", static_cast<int>(messageId));
-            return MessageId::Invalid;
-        }
+        Logger::instance()->info("Read %s. length: %d, messageId: %d\n", MessageName(messageId).c_str(), length, messageId);
 
-        Logger::instance()->info("Read %s (length: %d bytes)\n", MessageName(messageId).c_str(), length);
+        unsigned char* buffer = new unsigned char[length];
+        readBytes = read(m_fd, buffer, length);
 
-        // Read payload (even if we don't parse it, we must consume it)
-        if (length > 0) {
-            unsigned char* buffer = new unsigned char[length];
-            ssize_t total_read = 0;
-
-            while (total_read < length) {
-                readBytes = read(m_fd, buffer + total_read, length - total_read);
-                if (readBytes <= 0) {
-                    Logger::instance()->error("Error reading payload: %s\n", strerror(errno));
-                    delete[] buffer;
-                    return MessageId::Invalid;
-                }
-                total_read += readBytes;
-            }
-
-            delete[] buffer;
-        }
+        delete[] buffer;
 
         return messageId;
     }
 
     int m_fd;
-    State m_state;
 };
 #pragma endregion AAWirelessLauncher
 
@@ -282,12 +169,8 @@ void AAWirelessProfile::NewConnection(DBus::Path path, std::shared_ptr<DBus::Fil
     Logger::instance()->info("AA Wireless NewConnection\n");
     Logger::instance()->info("Path: %s, fd: %d\n", path.c_str(), fd->descriptor());
 
-    if (!AAWirelessLauncher(fd->descriptor()).launch()) {
-        Logger::instance()->error("Bluetooth launch sequence failed\n");
-        return;
-    }
-
-    Logger::instance()->info("Bluetooth launch sequence completed successfully\n");
+    AAWirelessLauncher(fd->descriptor()).launch();
+    Logger::instance()->info("Bluetooth launch sequence completed\n");
 }
 
 void AAWirelessProfile::RequestDisconnection(DBus::Path path) {
