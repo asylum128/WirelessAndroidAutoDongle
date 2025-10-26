@@ -5,12 +5,6 @@ hw_mode=g
 ieee80211n=1
 channel=6
 
-# Enable WMM (Wi-Fi Multimedia) for QoS
-wmm_enabled=1
-
-# HT (High Throughput) capabilities for better performance
-ht_capab=[HT40+][SHORT-GI-20][SHORT-GI-40][DSSS_CCK-40]
-
 auth_algs=1
 wpa=2
 wpa_key_mgmt=WPA-PSK
