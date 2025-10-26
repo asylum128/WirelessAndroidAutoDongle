@@ -208,7 +208,7 @@ void BluetoothHandler::connectDevice() {
             std::shared_ptr<DBus::PropertyProxy<std::string>> deviceAddress =
                 bluezDevice->create_property<std::string>(INTERFACE_BLUEZ_DEVICE, "Address");
 
-            if (deviceAddress && deviceAddress->get_value() == mac_address) {
+            if (deviceAddress && *deviceAddress == mac_address) {
                 if (tryConnectToDevice(path, isDongleMode)) {
                     return;
                 }
@@ -222,7 +222,7 @@ void BluetoothHandler::connectDevice() {
         std::shared_ptr<DBus::PropertyProxy<std::string>> deviceAddress =
             bluezDevice->create_property<std::string>(INTERFACE_BLUEZ_DEVICE, "Address");
 
-        std::string mac_address = deviceAddress ? deviceAddress->get_value() : "";
+        std::string mac_address = deviceAddress ? *deviceAddress : "";
 
         // Skip if already tried
         if (std::find(prioritized_macs.begin(), prioritized_macs.end(), mac_address) != prioritized_macs.end()) {
@@ -251,10 +251,10 @@ bool BluetoothHandler::tryConnectToDevice(const std::string& device_path, bool i
         std::shared_ptr<DBus::PropertyProxy<std::string>> deviceAddress = bluezDevice->create_property<std::string>(INTERFACE_BLUEZ_DEVICE, "Address");
         std::shared_ptr<DBus::PropertyProxy<std::string>> deviceName = bluezDevice->create_property<std::string>(INTERFACE_BLUEZ_DEVICE, "Name");
 
-        std::string mac_address = deviceAddress ? deviceAddress->get_value() : "unknown";
-        std::string name = deviceName ? deviceName->get_value() : "Unknown Device";
+        std::string mac_address = deviceAddress ? *deviceAddress : "unknown";
+        std::string name = deviceName ? *deviceName : "Unknown Device";
 
-        if (deviceConnected && deviceConnected->get_value()) {
+        if (deviceConnected && *deviceConnected) {
             Logger::instance()->info("Device already connected, disconnecting first\n");
             disconnect();
         }
@@ -275,7 +275,7 @@ bool BluetoothHandler::tryConnectToDevice(const std::string& device_path, bool i
             std::shared_ptr<DBus::ObjectProxy> bluezDevice = m_connection->create_object_proxy(BLUEZ_BUS_NAME, device_path);
             std::shared_ptr<DBus::PropertyProxy<std::string>> deviceAddress = bluezDevice->create_property<std::string>(INTERFACE_BLUEZ_DEVICE, "Address");
             if (deviceAddress) {
-                DeviceManager::instance()->recordConnectionFailure(deviceAddress->get_value());
+                DeviceManager::instance()->recordConnectionFailure(*deviceAddress);
             }
         } catch (...) {
             // Ignore errors getting MAC address
