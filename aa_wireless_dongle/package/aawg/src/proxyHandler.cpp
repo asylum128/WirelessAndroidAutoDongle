@@ -7,7 +7,6 @@
 #include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <sys/poll.h>
-#include <errno.h>
 #include <thread>
 #include <optional>
 #include <atomic>
@@ -18,336 +17,139 @@
 #include "bluetoothHandler.h"
 #include "proxyHandler.h"
 
-// ======== CircularBuffer Implementation ========
-
-CircularBuffer::CircularBuffer(size_t capacity)
-    : m_capacity(capacity), m_head(0), m_tail(0), m_size(0) {
-    m_buffer = new unsigned char[capacity];
+void empty_signal_handler(int signal) {
+    // Empty. We don't want to do anything but interrupt the thread.
 }
 
-CircularBuffer::~CircularBuffer() {
-    delete[] m_buffer;
-}
+ssize_t AAWProxy::readFully(int fd, unsigned char *buffer, size_t nbyte) {
+    size_t remaining_bytes = nbyte;
+    while (remaining_bytes > 0) {
+        ssize_t len = read(fd, buffer, remaining_bytes);
 
-size_t CircularBuffer::write(const unsigned char* data, size_t len) {
-    std::lock_guard<std::mutex> lock(m_mutex);
+        if (len <= 0) {
+            // Error, cannot read more.
+            return len;
+        }
 
-    size_t available_space = m_capacity - m_size;
-    size_t to_write = (len < available_space) ? len : available_space;
-
-    for (size_t i = 0; i < to_write; i++) {
-        m_buffer[m_tail] = data[i];
-        m_tail = (m_tail + 1) % m_capacity;
+        buffer += len;
+        remaining_bytes -= len;
     }
 
-    m_size += to_write;
-    return to_write;
-}
-
-size_t CircularBuffer::read(unsigned char* data, size_t len) {
-    std::lock_guard<std::mutex> lock(m_mutex);
-
-    size_t to_read = (len < m_size) ? len : m_size;
-
-    for (size_t i = 0; i < to_read; i++) {
-        data[i] = m_buffer[m_head];
-        m_head = (m_head + 1) % m_capacity;
-    }
-
-    m_size -= to_read;
-    return to_read;
-}
-
-size_t CircularBuffer::available() const {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    return m_size;
-}
-
-size_t CircularBuffer::space() const {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    return m_capacity - m_size;
-}
-
-void CircularBuffer::clear() {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    m_head = 0;
-    m_tail = 0;
-    m_size = 0;
-}
-
-// ======== AAWProxy Implementation ========
-
-AAWProxy::AAWProxy() {
-    // 256KB buffers for each direction
-    m_tcp_to_usb_buffer = new CircularBuffer(262144);
-    m_usb_to_tcp_buffer = new CircularBuffer(262144);
-}
-
-AAWProxy::~AAWProxy() {
-    delete m_tcp_to_usb_buffer;
-    delete m_usb_to_tcp_buffer;
-}
-
-bool AAWProxy::setNonBlocking(int fd) {
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags == -1) {
-        Logger::instance()->error("fcntl F_GETFL failed: %s\n", strerror(errno));
-        return false;
-    }
-
-    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) {
-        Logger::instance()->error("fcntl F_SETFL O_NONBLOCK failed: %s\n", strerror(errno));
-        return false;
-    }
-
-    return true;
+    return nbyte;
 }
 
 ssize_t AAWProxy::readMessage(int fd, unsigned char *buffer, size_t buffer_len) {
-    // For non-blocking reads, we need to handle partial reads properly
-    // Read the full message in a loop until we have everything
-
-    // Read first 4 bytes of header
-    size_t header_bytes_needed = 4;
-    size_t header_bytes_read = 0;
-    unsigned char header[8];
-
-    while (header_bytes_read < 4) {
-        ssize_t n = read(fd, header + header_bytes_read, 4 - header_bytes_read);
-        if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                if (header_bytes_read == 0) {
-                    // No data available yet
-                    return -1;
-                }
-                // Have partial data, keep trying (shouldn't happen often with poll)
-                continue;
-            }
-            return n; // Real error
-        }
-        if (n == 0) {
-            return 0; // Connection closed
-        }
-        header_bytes_read += n;
+    size_t header_length = 4;
+    if (ssize_t len = readFully(fd, buffer, header_length); len <= 0) {
+        return len;
     }
 
-    size_t message_length = (header[2] << 8) + header[3];
+    size_t message_length = (buffer[2] << 8) + buffer[3];
 
     constexpr char FRAME_TYPE_FIRST = 1 << 0;
     constexpr char FRAME_TYPE_LAST = 1 << 1;
     constexpr char FRAME_TYPE_MASK = FRAME_TYPE_FIRST | FRAME_TYPE_LAST;
-
-    size_t total_header_len = 4;
-    if ((header[1] & FRAME_TYPE_MASK) == FRAME_TYPE_FIRST) {
-        // Need to read 4 more bytes for extended header
-        while (header_bytes_read < 8) {
-            ssize_t n = read(fd, header + header_bytes_read, 8 - header_bytes_read);
-            if (n < 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    continue; // Keep trying
-                }
-                return n;
-            }
-            if (n == 0) {
-                return 0;
-            }
-            header_bytes_read += n;
-        }
+    if ((buffer[1] & FRAME_TYPE_MASK) == FRAME_TYPE_FIRST) { // This means the header is 8 bytes long, we need to read four more bytes.
         message_length += 4;
-        total_header_len = 8;
     }
 
-    if ((total_header_len + message_length) > buffer_len) {
+    if ((header_length + message_length) > buffer_len) {
+        // Not enough space in the buffer. This is unexpected.
         errno = EMSGSIZE;
         return -1;
     }
 
-    // Copy header to output buffer
-    memcpy(buffer, header, total_header_len);
-
-    // Read message body
-    size_t total_read = total_header_len;
-    while (total_read < (total_header_len + message_length)) {
-        ssize_t n = read(fd, buffer + total_read, (total_header_len + message_length) - total_read);
-        if (n < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                continue; // Keep trying until we get all data
-            }
-            return n;
-        }
-        if (n == 0) {
-            return 0;
-        }
-        total_read += n;
+    if (ssize_t len = readFully(fd, buffer + header_length, message_length); len <= 0) {
+        return len;
     }
 
-    return total_read;
+    return header_length + message_length;
 }
 
-void AAWProxy::forwardAsync(std::atomic<bool>& should_exit) {
-    Logger::instance()->info("Starting async I/O forwarding\n");
+void AAWProxy::forward(ProxyDirection direction, std::atomic<bool>& should_exit) {
+    size_t buffer_len = 16384;
+    unsigned char buffer[buffer_len];
 
-    unsigned char read_buffer[131072]; // 128KB read buffer
+    bool read_message;
+    int read_fd, write_fd;
+    std::string read_name, write_name;
+    switch (direction) {
+        case ProxyDirection::TCP_to_USB:
+            read_message = true;
 
-    struct pollfd fds[2];
-    fds[0].fd = m_tcp_fd;
-    fds[1].fd = m_usb_fd;
+            read_fd = m_tcp_fd;
+            read_name = "TCP";
+
+            write_fd = m_usb_fd;
+            write_name = "USB";
+            break;
+        case ProxyDirection::USB_to_TCP:
+            read_message = false;
+
+            read_fd = m_usb_fd;
+            read_name = "USB";
+
+            write_fd = m_tcp_fd;
+            write_name = "TCP";
+            break;
+    }
 
     while (!should_exit) {
-        // Determine what we want to poll for
-        fds[0].events = 0;
-        fds[1].events = 0;
+        // Read
+        ssize_t len = read_message ? readMessage(read_fd, buffer, buffer_len) : read(read_fd, buffer, buffer_len);
 
-        // We want to read from TCP if buffer has space
-        if (m_tcp_to_usb_buffer->space() > 0) {
-            fds[0].events |= POLLIN;
+        if (len <= 0) {
+            // Start logging read/write details if there is an error.
+            m_log_communication = true;
+        }
+        if (m_log_communication) {
+            Logger::instance()->info("%d bytes read from %s\n", len, read_name.c_str());
         }
 
-        // We want to write to TCP if buffer has data
-        if (m_usb_to_tcp_buffer->available() > 0) {
-            fds[0].events |= POLLOUT;
+        if (len < 0) {
+            Logger::instance()->info("Read from %s failed: %s\n", read_name.c_str(), strerror(errno));
+            break;
         }
-
-        // We want to read from USB if buffer has space
-        if (m_usb_to_tcp_buffer->space() > 0) {
-            fds[1].events |= POLLIN;
+        else if (len == 0) {
+            break;
         }
-
-        // We want to write to USB if buffer has data
-        if (m_tcp_to_usb_buffer->available() > 0) {
-            fds[1].events |= POLLOUT;
-        }
-
-        // Poll with 1 second timeout
-        int poll_result = poll(fds, 2, 1000);
-
-        if (poll_result < 0) {
-            if (errno == EINTR) {
-                continue; // Signal interrupted, check should_exit
-            }
-            Logger::instance()->error("poll() failed: %s\n", strerror(errno));
+        else if (should_exit) {
             break;
         }
 
-        if (poll_result == 0) {
-            // Timeout - check for shutdown
-            continue;
+        // Write
+        ssize_t wlen = write(write_fd, buffer, len);
+
+        if (wlen <= 0) {
+            // Start logging read/write details if there is an error.
+            m_log_communication = true;
+        }
+        if (m_log_communication) {
+            Logger::instance()->info("%d bytes written to %s\n", wlen, write_name.c_str());
         }
 
-        // Check for errors
-        if (fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
-            Logger::instance()->warn("TCP connection error/hangup\n");
+        if (wlen < 0) {
+            Logger::instance()->info("Write to %s failed: %s\n", write_name.c_str(), strerror(errno));
             break;
         }
-        if (fds[1].revents & (POLLERR | POLLHUP | POLLNVAL)) {
-            Logger::instance()->warn("USB connection error/hangup\n");
+        else if (should_exit) {
             break;
-        }
-
-        // Read from TCP
-        if (fds[0].revents & POLLIN) {
-            ssize_t n = readMessage(m_tcp_fd, read_buffer, sizeof(read_buffer));
-            if (n > 0) {
-                size_t written = m_tcp_to_usb_buffer->write(read_buffer, n);
-                m_bytes_tcp_to_usb += written;
-                if (m_log_communication) {
-                    Logger::instance()->debug("Read %zd bytes from TCP, buffered %zu\n", n, written);
-                }
-            } else if (n == 0) {
-                Logger::instance()->info("TCP connection closed\n");
-                break;
-            } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                Logger::instance()->error("Read from TCP failed: %s\n", strerror(errno));
-                break;
-            }
-        }
-
-        // Write to TCP
-        if (fds[0].revents & POLLOUT) {
-            size_t available = m_usb_to_tcp_buffer->available();
-            if (available > 0) {
-                size_t to_write = (available < sizeof(read_buffer)) ? available : sizeof(read_buffer);
-                size_t read_count = m_usb_to_tcp_buffer->read(read_buffer, to_write);
-
-                ssize_t n = write(m_tcp_fd, read_buffer, read_count);
-                if (n > 0) {
-                    if ((size_t)n < read_count) {
-                        // Partial write - put back unwritten data
-                        m_usb_to_tcp_buffer->write(read_buffer + n, read_count - n);
-                    }
-                    if (m_log_communication) {
-                        Logger::instance()->debug("Wrote %zd bytes to TCP\n", n);
-                    }
-                } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-                    Logger::instance()->error("Write to TCP failed: %s\n", strerror(errno));
-                    // Put data back
-                    m_usb_to_tcp_buffer->write(read_buffer, read_count);
-                    break;
-                } else {
-                    // EAGAIN - put data back
-                    m_usb_to_tcp_buffer->write(read_buffer, read_count);
-                }
-            }
-        }
-
-        // Read from USB
-        if (fds[1].revents & POLLIN) {
-            ssize_t n = read(m_usb_fd, read_buffer, sizeof(read_buffer));
-            if (n > 0) {
-                size_t written = m_usb_to_tcp_buffer->write(read_buffer, n);
-                m_bytes_usb_to_tcp += written;
-                if (m_log_communication) {
-                    Logger::instance()->debug("Read %zd bytes from USB, buffered %zu\n", n, written);
-                }
-            } else if (n == 0) {
-                Logger::instance()->info("USB connection closed\n");
-                break;
-            } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                Logger::instance()->error("Read from USB failed: %s\n", strerror(errno));
-                break;
-            }
-        }
-
-        // Write to USB
-        if (fds[1].revents & POLLOUT) {
-            size_t available = m_tcp_to_usb_buffer->available();
-            if (available > 0) {
-                size_t to_write = (available < sizeof(read_buffer)) ? available : sizeof(read_buffer);
-                size_t read_count = m_tcp_to_usb_buffer->read(read_buffer, to_write);
-
-                ssize_t n = write(m_usb_fd, read_buffer, read_count);
-                if (n > 0) {
-                    if ((size_t)n < read_count) {
-                        // Partial write - put back unwritten data
-                        m_tcp_to_usb_buffer->write(read_buffer + n, read_count - n);
-                    }
-                    if (m_log_communication) {
-                        Logger::instance()->debug("Wrote %zd bytes to USB\n", n);
-                    }
-                } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-                    Logger::instance()->error("Write to USB failed: %s\n", strerror(errno));
-                    // Put data back
-                    m_tcp_to_usb_buffer->write(read_buffer, read_count);
-                    break;
-                } else {
-                    // EAGAIN - put data back
-                    m_tcp_to_usb_buffer->write(read_buffer, read_count);
-                }
-            }
         }
     }
 
-    Logger::instance()->info("Async I/O forwarding stopped. TCP->USB: %lu bytes, USB->TCP: %lu bytes\n",
-                             m_bytes_tcp_to_usb.load(), m_bytes_usb_to_tcp.load());
+    stopForwarding(should_exit);
 }
 
 void AAWProxy::stopForwarding(std::atomic<bool>& should_exit) {
-    Logger::instance()->info("Stopping forwarding\n");
+    Logger::instance()->info("Interrupting threads to stop forwarding\n");
     should_exit = true;
 
-    if (m_forward_thread && m_forward_thread->joinable()) {
-        m_forward_thread->join();
-        m_forward_thread = std::nullopt;
+    if (m_usb_tcp_thread) {
+        pthread_kill(m_usb_tcp_thread->native_handle(), SIGUSR1);
+    }
+
+    if (m_tcp_usb_thread) {
+        pthread_kill(m_tcp_usb_thread->native_handle(), SIGUSR1);
     }
 }
 
@@ -356,96 +158,71 @@ void AAWProxy::handleClient(int server_sock) {
     socklen_t client_addresslen = sizeof(client_address);
     if ((m_tcp_fd = accept(server_sock, &client_address, &client_addresslen)) < 0) {
         close(server_sock);
-        Logger::instance()->error("accept failed: %s\n", strerror(errno));
+        Logger::instance()->info("accept failed: %s\n", strerror(errno));
         return;
     }
 
     close(server_sock);
 
-    Logger::instance()->info("TCP server accepted connection\n");
+    Logger::instance()->info("Tcp server accepted connection\n");
 
     // Phone connected via TCP, we can stop retrying bluetooth connection
     BluetoothHandler::instance().stopConnectWithRetry();
 
     if (Config::instance()->getConnectionStrategy() != ConnectionStrategy::USB_FIRST) {
         if (!UsbManager::instance().enableDefaultAndWaitForAccessory(std::chrono::seconds(30))) {
-            close(m_tcp_fd);
-            m_tcp_fd = -1;
             return;
         }
     }
 
     Logger::instance()->info("Opening usb accessory\n");
     if ((m_usb_fd = open("/dev/usb_accessory", O_RDWR)) < 0) {
-        Logger::instance()->error("error opening /dev/usb_accessory: %s\n", strerror(errno));
-        close(m_tcp_fd);
-        m_tcp_fd = -1;
+        Logger::instance()->info("error opening /dev/usb_accessory: %s\n", strerror(errno));
         return;
     }
 
-    // Set both file descriptors to non-blocking mode
-    if (!setNonBlocking(m_tcp_fd)) {
-        Logger::instance()->error("Failed to set TCP socket to non-blocking\n");
-        close(m_usb_fd);
-        close(m_tcp_fd);
-        m_usb_fd = -1;
-        m_tcp_fd = -1;
-        return;
-    }
-
-    if (!setNonBlocking(m_usb_fd)) {
-        Logger::instance()->error("Failed to set USB FD to non-blocking\n");
-        close(m_usb_fd);
-        close(m_tcp_fd);
-        m_usb_fd = -1;
-        m_tcp_fd = -1;
-        return;
-    }
-
-    // Increase TCP socket buffer sizes for better streaming performance
-    int tcp_buffer_size = 262144; // 256KB
-    if (setsockopt(m_tcp_fd, SOL_SOCKET, SO_RCVBUF, &tcp_buffer_size, sizeof(tcp_buffer_size))) {
-        Logger::instance()->warn("setsockopt SO_RCVBUF failed: %s\n", strerror(errno));
-    }
-    if (setsockopt(m_tcp_fd, SOL_SOCKET, SO_SNDBUF, &tcp_buffer_size, sizeof(tcp_buffer_size))) {
-        Logger::instance()->warn("setsockopt SO_SNDBUF failed: %s\n", strerror(errno));
-    }
-
-    // Enable TCP keepalive
-    int keepalive = 1;
-    if (setsockopt(m_tcp_fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive))) {
-        Logger::instance()->warn("setsockopt SO_KEEPALIVE failed: %s\n", strerror(errno));
-    }
-
+    // Optimize TCP socket for streaming (inspired by aa-proxy-rs)
     // Enable TCP_NODELAY (disable Nagle's algorithm) for lower latency
-    // This is crucial for real-time audio/video streaming
     int nodelay = 1;
-    if (setsockopt(m_tcp_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay))) {
-        Logger::instance()->warn("setsockopt TCP_NODELAY failed: %s\n", strerror(errno));
-    } else {
-        Logger::instance()->info("TCP_NODELAY enabled for low-latency streaming\n");
+    setsockopt(m_tcp_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+
+    // Increase TCP socket buffer sizes for better streaming
+    int tcp_buffer_size = 262144; // 256KB
+    setsockopt(m_tcp_fd, SOL_SOCKET, SO_RCVBUF, &tcp_buffer_size, sizeof(tcp_buffer_size));
+    setsockopt(m_tcp_fd, SOL_SOCKET, SO_SNDBUF, &tcp_buffer_size, sizeof(tcp_buffer_size));
+
+    // Set timeout on the TCP socket
+    struct timeval tv = {
+        .tv_sec = 10,
+        .tv_usec = 0,
+    };
+
+    if (setsockopt(m_tcp_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv))) {
+        Logger::instance()->info("setsockopt failed: %s\n", strerror(errno));
+        return;
     }
 
-    // Set high priority for this socket in the kernel
-    // Priority 6 is for interactive traffic (audio/video)
-    int priority = 6;
-    if (setsockopt(m_tcp_fd, SOL_SOCKET, SO_PRIORITY, &priority, sizeof(priority))) {
-        Logger::instance()->warn("setsockopt SO_PRIORITY failed: %s\n", strerror(errno));
-    } else {
-        Logger::instance()->info("Socket priority set to %d for better QoS\n", priority);
+    // Setup signal handler
+    struct sigaction sa;
+    sa.sa_handler = empty_signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    if (sigaction(SIGUSR1, &sa, NULL)) {
+        Logger::instance()->info("Adding signal handler failed: %s\n", strerror(errno));
     }
 
-    Logger::instance()->info("Starting async I/O between TCP and USB\n");
-
-    // Clear buffers
-    m_tcp_to_usb_buffer->clear();
-    m_usb_to_tcp_buffer->clear();
-    m_bytes_tcp_to_usb = 0;
-    m_bytes_usb_to_tcp = 0;
-
+    Logger::instance()->info("Forwarding data between TCP and USB\n");
     std::atomic<bool> should_exit = false;
-    // Call forwardAsync directly - we're already in a thread from startServer()
-    forwardAsync(should_exit);
+    m_usb_tcp_thread = std::thread(&AAWProxy::forward, this, ProxyDirection::USB_to_TCP, std::ref(should_exit));
+    m_tcp_usb_thread = std::thread(&AAWProxy::forward, this, ProxyDirection::TCP_to_USB, std::ref(should_exit));
+
+    m_usb_tcp_thread->join();
+    m_usb_tcp_thread = std::nullopt;
+
+    m_tcp_usb_thread->join();
+    m_tcp_usb_thread = std::nullopt;
+
+    signal(SIGUSR1, SIG_DFL);
 
     close(m_usb_fd);
     m_usb_fd = -1;
@@ -453,21 +230,20 @@ void AAWProxy::handleClient(int server_sock) {
     close(m_tcp_fd);
     m_tcp_fd = -1;
 
-    Logger::instance()->info("Client handling completed\n");
+    Logger::instance()->info("Forwarding stopped\n");
 }
 
 std::optional<std::thread> AAWProxy::startServer(int32_t port) {
-    Logger::instance()->info("Starting tcp server on port %d\n", port);
+    Logger::instance()->info("Starting tcp server\n");
     int server_sock;
     if ((server_sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-        Logger::instance()->error("creating socket failed: %s\n", strerror(errno));
+        Logger::instance()->info("creating socket failed: %s\n", strerror(errno));
         return std::nullopt;
     }
 
     int opt = 1;
     if (setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt))) {
-        Logger::instance()->error("setsockopt failed: %s\n", strerror(errno));
-        close(server_sock);
+        Logger::instance()->info("setsockopt failed: %s\n", strerror(errno));
         return std::nullopt;
     }
 
@@ -477,18 +253,16 @@ std::optional<std::thread> AAWProxy::startServer(int32_t port) {
     address.sin_port = htons(port);
 
     if (bind(server_sock, (struct sockaddr*)&address, sizeof(address)) < 0) {
-        Logger::instance()->error("bind failed: %s\n", strerror(errno));
-        close(server_sock);
+        Logger::instance()->info("bind failed: %s\n", strerror(errno));
         return std::nullopt;
     }
 
     if (listen(server_sock, 3) < 0) {
-        Logger::instance()->error("listen failed: %s\n", strerror(errno));
-        close(server_sock);
+        Logger::instance()->info("listen failed: %s\n", strerror(errno));
         return std::nullopt;
     }
 
-    Logger::instance()->info("TCP server listening on port %d\n", port);
+    Logger::instance()->info("Tcp server listening on %d\n", port);
 
     return std::thread(&AAWProxy::handleClient, this, server_sock);
 }
